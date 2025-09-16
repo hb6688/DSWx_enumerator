@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dswx-enumerator"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["requests","jinja2","ruamel.yaml","click","tqdm","pydantic-settings","python-dateutil"]
+
+[project.scripts]
+dswxni = "dswx-enumerator.cli:main"
