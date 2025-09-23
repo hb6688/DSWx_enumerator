@@ -4,11 +4,14 @@ from __future__ import annotations
 import dataclasses as dc
 from dataclasses import asdict
 from functools import lru_cache
-from typing import Any, Iterable, Literal
+from typing import Any, Iterable, Literal, Optional
+from pathlib import Path
+
 import json
 import logging
 import os
 import time
+from urllib.parse import urlparse, urlunparse
 
 import requests
 
@@ -48,18 +51,35 @@ KNOWN_CIDS: dict[tuple[str, str], str] = {
 # Environment override: DSWXNI_CMR_SHORTNAME_MAP='{"ASF:ALOS_PALSAR_RTC_HiRes":"C1206487504-ASF"}'
 ENV_SHORTNAME_MAP = "DSWXNI_CMR_SHORTNAME_MAP"
 
-
+_DATA_REL_HINTS = (
+    "data#",  # 'http://esipfed.org/ns/fedsearch/1.1/data#' endswith 'data#'
+    "/data#",  # sometimes appears as full URL path
+)
 # ---------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------
 @dc.dataclass
 class Link:
     href: str
-    rel: str | None = None
-    title: str | None = None
-    type: str | None = None
-    inherited: bool | None = None
+    rel: Optional[str] = None
+    title: Optional[str] = None
+    type: Optional[str] = None
+    inherited: Optional[bool] = None
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "href": self.href,
+            "rel": self.rel,
+            "title": self.title,
+            "type": self.type,
+            "inherited": self.inherited,
+        }
+
+def _normalize_url(u: str) -> str:
+    """Drop fragment/query so duplicate links with different tokens dedupe cleanly."""
+    p = urlparse(u)
+    p = p._replace(query="", fragment="")
+    return urlunparse(p)
 
 @dc.dataclass
 class Granule:
@@ -263,23 +283,95 @@ def resolve_collection_concept_id(
 # ---------------------------------------------------------------------
 # Param builder / parsing
 # ---------------------------------------------------------------------
-def _parse_links(entry: dict[str, Any]) -> list[Link]:
-    links = []
-    for l in entry.get("links", []) or []:
+def _parse_links(entry: dict[str, Any], *, include_inherited: bool = False) -> list[Link]:
+    """
+    Parse ALL links from a CMR granule entry.
+    - Skips empty hrefs
+    - By default skips 'inherited' collection links (browse, docs). Set include_inherited=True to keep them.
+    - Dedupes by (normalized href, rel, type)
+    """
+    out: list[Link] = []
+    seen: set[tuple[str, Optional[str], Optional[str]]] = set()
+
+    for l in (entry.get("links") or []):
         href = l.get("href")
         if not href:
             continue
-        links.append(
-            Link(
-                href=href,
-                rel=l.get("rel"),
-                title=l.get("title"),
-                type=l.get("type"),
-                inherited=l.get("inherited"),
-            )
-        )
-    return links
+        inherited = bool(l.get("inherited"))
+        if (not include_inherited) and inherited:
+            continue
+        href_norm = _normalize_url(str(href))
+        rel = l.get("rel")
+        typ = l.get("type")
+        key = (href_norm, rel, typ)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(Link(href=href_norm, rel=rel, title=l.get("title"), type=typ, inherited=inherited))
 
+    return out
+
+ALLOWED_EXT = {".zip", ".tif", ".tiff", ".h5"}  # adjust as needed
+
+def _download_candidates(links: Iterable[Link]) -> list[str]:
+    """
+    Rank links and return best download URLs (you can keep >1 per granule if needed).
+    Ranking heuristic:
+      + prefers HTTPS
+      + prefers rel that looks like 'data#'
+      + prefers allowed file extensions
+      − penalizes OPeNDAP/browse/docs
+    """
+    scored: list[tuple[int, str]] = []
+
+    for lk in links:
+        url = lk.href
+        p = urlparse(url)
+        if p.scheme not in ("http", "https"):
+            continue
+
+        score = 0
+        if p.scheme == "https":
+            score += 4
+
+        # Penalize known non-downloads
+        low = url.lower()
+        if "/opendap" in low or "/dap/" in low:
+            score -= 20
+        if "browse" in low or (lk.rel and "browse" in lk.rel.lower()):
+            score -= 10
+        if lk.rel:
+            for hint in _DATA_REL_HINTS:
+                if lk.rel.endswith(hint):
+                    score += 6
+                    break
+
+        # Extension/type hints
+        ext = Path(p.path).suffix.lower()
+        if ext in ALLOWED_EXT:
+            score += 5
+        if lk.type:
+            if "geotiff" in lk.type or "tiff" in lk.type:
+                score += 3
+            if "hdf5" in lk.type or "hdf" in lk.type or "netcdf" in lk.type or "zip" in lk.type:
+                score += 2
+
+        scored.append((score, url))
+
+    # Sort desc by score, keep order-stable for ties
+    scored.sort(key=lambda t: t[0], reverse=True)
+
+    # Deduplicate by normalized path (avoid same file with different query tokens)
+    seen_paths: set[str] = set()
+    out: list[str] = []
+    for _, u in scored:
+        path = urlparse(u).path
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        out.append(u)
+
+    return out
 
 def _entry_to_granule(e: dict[str, Any]) -> Granule:
     size_mb = float(e.get("granule_size", 0.0)) if e.get("granule_size") else None

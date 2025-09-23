@@ -17,11 +17,13 @@ DEFAULTS = {
     "reference_water_file_default": "/mnt/aurora-r0/jungkyo/data/pekel.vrt",
     "hand_file_default": "/mnt/aurora-r0/jungkyo/data/hand/data/EPSG4326.vrt",
     "eth_global_canopy_file_default": "/mnt/aurora-r0/jungkyo/OPERA/DSWx-NI/ETH_Global_canopy_height/ETH.vrt",
-    "algorithm_parameters_default": "/mnt/aurora-r0/jungkyo/OPERA/DSWx-NI/scale/algorithm_parameter_ni2.yaml",
+    "algorithm_parameters_ni_default": "/mnt/aurora-r0/jungkyo/OPERA/DSWx-NI/scale/algorithm_parameter_ni2.yaml",
+    "algorithm_parameters_s1_default": "/mnt/aurora-r0/jungkyo/OPERA/DSWx-S1-final-patch/shared/input_dir/ancillary_data/algorithm_parameters_s1.yaml",
 
     # static_ancillary_file_group
     "mgrs_database_file_default": "/mnt/aurora-r0/jungkyo/OPERA/DSWx-NI/R1_interface/sample_data/input_dir/ancillary_data/MGRS_tile.sqlite",
-    "mgrs_collection_database_file_default": "/mnt/aurora-r0/jungkyo/OPERA/DSWx-NI/R1_interface/sample_data/input_dir/ancillary_data/MGRS_collection_db_DSWx-NI_v0.1.sqlite",
+    "mgrs_collection_database_ni_file_default": "/mnt/aurora-r0/jungkyo/OPERA/DSWx-NI/R1_interface/sample_data/input_dir/ancillary_data/MGRS_collection_db_DSWx-NI_v0.1.sqlite",
+    "mgrs_collection_database_s1_file_default": "/mnt/aurora-r0/jungkyo/OPERA/DSWx-S1-final-patch/shared/input_dir/ancillary_data/MGRS_tile_collection_v0.3.sqlite",
 
     # product/scratch roots (can be set by env; see `paths_from_env`)
     "product_root_default": "products",

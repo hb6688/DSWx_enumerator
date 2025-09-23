@@ -1,8 +1,8 @@
 runconfig:
-  name: {{ params.name | default('dswx_ni_workflow_default') }}
+  name: {{ params.name | default('dswx_s1_workflow_default') }}
   groups:
     pge_name_group:
-      pge_name: DSWX_NI_PGE
+      pge_name: DSWX_S1_PGE
 
     input_file_group:
       # List of local input files (RTC/GCOV). We render one per granule by default.
@@ -14,8 +14,6 @@ runconfig:
       {% else -%}
       - {{ local_path }}
       {% endif %}
-      input_file_historical_path: {{ params.input_file_historical_path | default('null') }}
-      input_mgrs_collection_id: {{ params.input_mgrs_collection_id | default('null') }}
 
     dynamic_ancillary_file_group:
       dem_file: {{ params.dem_file
@@ -38,14 +36,11 @@ runconfig:
                     | default(env.DSWXNI_HAND_FILE
                       | default(paths.hand_file_default)) }}
       hand_file_description: {{ params.hand_file_description | default('null') }}
-      eth_global_canopy_file: {{ params.eth_global_canopy_file
-                                 | default(env.DSWXNI_CANOPY_FILE
-                                   | default(paths.eth_global_canopy_file_default)) }}
       shoreline_shapefile: {{ params.shoreline_shapefile | default('null') }}
       shoreline_shapefile_description: {{ params.shoreline_shapefile_description | default('null') }}
       algorithm_parameters: {{ params.algorithm_parameters
                                | default(env.DSWXNI_ALGO_PARAMS
-                                 | default(paths.algorithm_parameters_ni_default)) }}
+                                 | default(paths.algorithm_parameters_s1_default)) }}
 
     static_ancillary_file_group:
       static_ancillary_inputs_flag: {{ params.static_ancillary_inputs_flag | default(true) }}
@@ -54,10 +49,10 @@ runconfig:
                                | default(paths.mgrs_database_file_default)) }}
       mgrs_collection_database_file: {{ params.mgrs_collection_database_file
                                         | default(env.DSWXNI_MGRS_COLLECTION_DB
-                                          | default(paths.mgrs_collection_database_ni_file_default)) }}
+                                          | default(paths.mgrs_collection_database_s1_file_default)) }}
 
     primary_executable:
-      product_type: dswx_ni
+      product_type: dswx_s1
 
     product_path_group:
       # Derived from input basename unless user overrides via params.*
@@ -67,3 +62,39 @@ runconfig:
                        | default(paths.scratch_root ~ '/' ~ product_basename) }}
       sas_output_path: {{ params.sas_output_path
                           | default(paths.product_root ~ '/' ~ product_basename ~ '_output1') }}
+
+    browse_image_group:
+        # Save a full-res Cloud-Optimized GEOTIFF DSWx-S1 browse image and
+        # a modified-resolution PNG of the browse image for DSWx-S1
+        save_browse: True
+
+        # Setting `browse_image_height` and `browse_image_width` equal
+        # will maintain this original DSWx-S1 aspect ratio
+        # of 3660 pixels x 3660 pixels for the PNG browse image.
+        # If these fields are left empty, 1024 x 1024 will be used.
+        # Height in pixels for the PNG browse image
+        browse_image_height: 1024
+
+        # Width in pixels for the PNG browse image
+        browse_image_width: 1024
+
+        # Flag to collapse water classes if set to True. Default is True.
+        flag_collapse_wtr_classes: True
+
+        # Flag to exclude inundated vegetation from processing if set to True. 
+        exclude_inundated_vegetation:  False
+
+        # Flag to set non-water pixels to NoData value if set to True. 
+        set_not_water_to_nodata: False
+
+        # Flag to set HAND mask pixels to NoData value if set to True. 
+        set_hand_mask_to_nodata: True
+
+        # Flag to set layover and shadow pixels to NoData value if set to True. 
+        set_layover_shadow_to_nodata: True
+        
+        # Flag to set ocean-masked pixels to NoData value if set to True. 
+        set_ocean_masked_to_nodata: False
+
+        # Flag to save Geotiff to output directory if set to True. 
+        save_tif_to_output: True

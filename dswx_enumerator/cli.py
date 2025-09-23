@@ -34,6 +34,7 @@ from .downloader import download_all
 from .settings import SETTINGS
 from .yaml_builder import render_runconfig
 
+ALLOWED_EXT = {".zip", ".tif", ".tiff", ".h5"}
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -100,13 +101,213 @@ def _extract_track_s1(granule_dict: dict) -> str | None:
         return producer_granule_id.split("_")[3].split("-")[0][1:]
     return None
 
-def _default_ni_template_path() -> Path:
+def _default_template_path(sensor: str) -> Path:
     """
-    Return <repo_root>/templates/runconfig_dswx_ni.j2.
-    Assumes this file lives at <repo_root>/dswx_enumerator/cli.py
+    Pick a default template based on sensor.
+      alos1       -> templates/runconfig_dswx_ni.j2
+      sentinel-1  -> templates/runconfig_dswx_ni_s1.j2 (falls back to NI)
+      nisar       -> templates/runconfig_dswx_ni_nisar.j2 (falls back to NI)
     """
-    repo_root = Path(__file__).resolve().parents[1]
-    return repo_root / "dswx_enumerator" / "template" / "runconfig_dswx_ni.j2"
+    root = Path(__file__).resolve().parents[1] / "templates"
+    mapping = {
+        "alos1": root / "runconfig_dswx_ni.j2",
+        "sentinel-1": root / "runconfig_dswx_s1.j2",
+        "nisar": root / "runconfig_dswx_ni.j2",
+    }
+    p = mapping.get(sensor.lower(), root / "runconfig_dswx_ni.j2")
+    # Fallbacks to NI template when a sensor-specific template is absent
+    if not p.exists():
+        fallback = root / "runconfig_dswx_ni.j2"
+        click.echo(f"Note: default template for sensor='{sensor}' not found at {p}. "
+                   f"Falling back to {fallback}.")
+        return fallback
+    return p
+
+_S1_KEY_RE = re.compile(r"(T\d{3}-\d{6}-IW[1-3])", re.IGNORECASE)  # group key for S1
+
+def _is_allowed_url(u: str) -> bool:
+    try:
+        p = urlparse(u)
+        if p.scheme not in ("http", "https"):
+            return False
+        if "/opendap" in u.lower():
+            return False
+        return Path(p.path).suffix.lower() in ALLOWED_EXT
+    except Exception:
+        return False
+
+
+def _search_core(
+    spec: CollectionSpec,
+    *,
+    bbox: Optional[str],
+    polygon_wkt: Optional[str],
+    db_path: Optional[Path],
+    mgrs_set_id: Optional[str],
+    layer: Optional[str],
+    id_col: str,
+    start: Optional[str],
+    end: Optional[str],
+    max_items: int,
+) -> list[dict]:
+    """Return normalized granule dicts (no printing, no saving)."""
+    using_db = bool(db_path and mgrs_set_id)
+    if using_db:
+        cmr_polys = _polygons_from_db_general(
+            db_path=db_path,
+            mgrs_set_id=mgrs_set_id,
+            layer=layer,
+            id_col=id_col,
+        )
+        by_id: dict[str, dict] = {}
+        for poly_str in cmr_polys:
+            spatial = Spatial(polygon_wkt=poly_str)
+            part = search_cmr_flexible(
+                spec, spatial=spatial, temporal=Temporal(start=start, end=end), max_items=max_items
+            )
+            for g in part:
+                by_id[g.id] = g.to_dict()
+        return list(by_id.values())
+    else:
+        spatial = Spatial(polygon_wkt=polygon_wkt) if polygon_wkt else Spatial(bbox=_parse_bbox(bbox))
+        granules = search_cmr_flexible(
+            spec, spatial=spatial, temporal=Temporal(start=start, end=end), max_items=max_items
+        )
+        return [g.to_dict() for g in granules]
+
+
+def _group_by_track_payload(
+    payload: list[dict], *, short_name: Optional[str], concept_id: Optional[str]
+) -> dict[str, list[dict]]:
+    """Group payload by track (S1 uses producer_granule_id parse)."""
+    by_track: dict[str, list[dict]] = defaultdict(list)
+    s1 = (short_name == "OPERA_L2_RTC-S1_V1") or (concept_id == "C2777436413-ASF")
+    for d in payload:
+        t = _extract_track_s1(d) if s1 else (_extract_track(d) or "unknown")
+        by_track[t].append(d)
+    return by_track
+
+
+def _urls_from_payload(payload: list[dict]) -> list[str]:
+    """All candidate links from all granules (filtered, ranked, deduped by path)."""
+    urls: list[str] = []
+    seen_paths: set[str] = set()
+    for d in payload:
+        for u in _data_links_from_granule(d):
+            path = urlparse(u).path
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            urls.append(u)
+    return urls
+
+
+def _granule_files_present(
+    payload: list[dict], *, root: Path
+) -> dict[str, list[Path]]:
+    """Map granule-id/title → list of files that actually exist under root."""
+    granule_files: dict[str, list[Path]] = {}
+    for d in payload:
+        gid = d.get("id") or d.get("title") or "granule"
+        files: list[Path] = []
+        for u in _data_links_from_granule(d):
+            name = Path(urlparse(u).path).name
+            if not name:
+                continue
+            p = (root / name).resolve()
+            if p.exists():
+                files.append(p)
+        if files:
+            granule_files[gid] = sorted(files, key=lambda x: x.name)
+    return granule_files
+
+
+def _render_by_sensor(
+    *, sensor: str, template: Path, granule_files: dict[str, list[Path]],
+    yaml_out: Path, params_d: dict, organize_s1: bool = False, root: Optional[Path] = None
+) -> int:
+    """Render YAMLs and return count created."""
+    made = 0
+
+    sensor_key = sensor.lower()
+    if sensor_key == "alos1":
+        # One YAML per file
+        # for p in local_files:
+        files = [granule_files.items]
+        text = render_runconfig(
+            template_path=template,
+            local_path=str(files[0]),
+            params=params_d,
+            input_files=(files)
+        )
+        # Prefer granule id where available
+        # dmatch = next((d for d in data if Path(urlparse(_first_data_link(d) or "").path).name == p.name), {})
+        # yname = f"{dmatch.get('id', p.stem)}.yml"
+        out_file = yaml_out / f"{d.get('id', name)}.yml"
+        # out_file = yaml_out / yname
+        out_file.write_text(text)
+        click.echo(f"✓ {out_file.name} (ALOS-1)")
+        made += 1
+
+    elif sensor_key == "sentinel-1":
+        # Group across ALL files by Tddd-dddddd-IW[1-3]
+        groups: dict[str, list[Path]] = {}
+        for files in granule_files.values():
+            for p in files:
+                key = _s1_group_key_from_name(p.name)
+                if key:
+                    groups.setdefault(key, []).append(p)
+                else:
+                    click.echo(f"• skipping non-S1-pattern file: {p.name}")
+        group_dirs = []
+        for key, files in groups.items():
+            grp_dir = root / key
+            grp_dir.mkdir(parents=True, exist_ok=True)
+            moved: list[Path] = []
+            for src in files:
+                dest = grp_dir / src.name
+                if src.resolve() != dest.resolve():
+                    dest.write_bytes(src.read_bytes())
+                    src.unlink()
+                moved.append(dest)
+            groups[key] = sorted(moved, key=lambda x: x.name)
+            group_dirs.append(grp_dir)
+            click.echo(f"Organized {len(moved)} file(s) → {grp_dir}")
+
+        # for key, files in sorted(groups.items()):
+        text = render_runconfig(
+            template_path=template,
+            local_path=str(group_dirs[0]),               # representative
+            input_files=group_dirs,    # ALL files in group
+            params=params_d,
+        )
+        out_file = yaml_out / f"S1_{key}.yml"
+        out_file.write_text(text)
+        click.echo(f"✓ {out_file.name} (S1 group: {key}, {len(files)} files)")
+        made += 1
+
+    elif sensor_key == "nisar":
+        # Treat like single-file per granule; use NISAR template if present else NI (already handled)
+        text = render_runconfig(
+            template_path=template,
+            local_path=str(files[0]),
+            params=params_d,
+            input_files=(files)
+
+        )
+        dmatch = next((d for d in data if Path(urlparse(_first_data_link(d) or "").path).name == p.name), {})
+        yname = f"{dmatch.get('id', p.stem)}.yml"
+        out_file = yaml_out / yname
+        out_file.write_text(text)
+        click.echo(f"✓ {out_file.name} (NISAR)")
+        made += 1
+
+    else:
+        raise click.ClickException(f"Unsupported sensor: {sensor}")
+
+    # Summary
+    click.echo(f"\nWrote {made} runconfigs → {yaml_out}")
+
 
 # -----------------------------------------------------------------------------
 # Top-level group
@@ -388,6 +589,18 @@ def search_cmd(
 # -----------------------------------------------------------------------------
 # download
 # -----------------------------------------------------------------------------
+from collections.abc import Iterable
+
+def _as_str_list(x) -> list[str]:
+    if not x:
+        return []
+    if isinstance(x, str):
+        return [x]
+    if isinstance(x, Iterable):
+        return [s for s in x if isinstance(s, str)]
+    return []
+
+
 @main.command("download")
 @click.argument("search_json", type=click.Path(path_type=Path))
 @click.option(
@@ -446,10 +659,8 @@ def download_cmd(
       • Existing files are skipped unless --overwrite is set.
       • With --resume, partial '.part' files continue if the server supports it.
     """
-    ALLOWED_EXT = {".zip", ".tif", ".tiff", ".h5"}  # tweak if you want more
 
     data = _read_json(search_json)
-
     # Prefer strict HTTPS data links (avoid OPeNDAP), fall back to first HTTP(S).
     def _is_http(u: str) -> bool:
         try:
@@ -469,7 +680,7 @@ def download_cmd(
     data = _read_json(search_json)
 
     # Prefer HTTPS direct data links with allowed extensions.
-    urls = []
+    urls: list[str] = []
     for d in data:
         links = d.get("links", []) or []
 
@@ -503,10 +714,9 @@ def download_cmd(
             ]
 
         if best:
-            urls.append(best[0])
-
+            urls.extend(_as_str_list(best))
     # De-duplicate while preserving order
-    seen = set()
+    seen: set[str] = set()
     urls = [u for u in urls if not (u in seen or seen.add(u))]
 
     if not urls:
@@ -533,26 +743,91 @@ def download_cmd(
 
 from urllib.parse import urlparse
 
-ALLOWED_EXT = {".zip", ".tif", ".tiff", ".h5"}
-
 def _first_data_link(d: dict) -> str | None:
     links = d.get("links", []) or []
-    # Prefer HTTPS, allowed extensions, non-OPeNDAP
-    def ok(u: str) -> bool:
+    best = [
+        l["href"] for l in links
+        if isinstance(l, dict) and isinstance(l.get("href"), str) and _is_allowed_url(l["href"])
+    ]
+    if best:
+        https_first = [u for u in best if u.startswith("https://")]
+        return (https_first or best)[0]   # <- pick ONE
+    fb = [
+        l["href"] for l in links
+        if isinstance(l, dict) and str(l.get("href","")).startswith(("http://", "https://"))
+    ]
+    return fb[0] if fb else None
+
+def _s1_group_key_from_name(name: str) -> str | None:
+    m = _S1_KEY_RE.search(name)
+    return m.group(1) if m else None
+
+from urllib.parse import urlparse, urlunparse
+from pathlib import Path
+
+
+def _normalize_url(u: str) -> str:
+    """Drop query/fragment so identical files with different tokens dedupe cleanly."""
+    p = urlparse(u)
+    return urlunparse(p._replace(query="", fragment=""))
+
+def _data_links_from_granule(d: dict) -> list[str]:
+    """
+    Return ALL candidate download URLs for a granule, filtered and ranked.
+    - http/https only
+    - avoid OPeNDAP
+    - extension in ALLOWED_EXT
+    - prefer https, data-ish rel/type, allowed suffix
+    - stable-dedup by path
+    """
+    links = d.get("links") or []
+    scored: list[tuple[int, str]] = []
+
+    for l in links:
+        if not isinstance(l, dict):
+            continue
+        href = l.get("href")
+        if not isinstance(href, str):
+            continue
+        u = _normalize_url(href)
         p = urlparse(u)
         if p.scheme not in ("http", "https"):
-            return False
-        if "/opendap" in u.lower():
-            return False
+            continue
+        low = u.lower()
+        if "/opendap" in low or "/dap/" in low:
+            continue
         ext = Path(p.path).suffix.lower()
-        return ext in ALLOWED_EXT
-    best = [l["href"] for l in links if isinstance(l, dict) and isinstance(l.get("href"), str) and ok(l["href"])]
-    if best:
-        return best[0]
-    # last resort: any http(s) link
-    fallback = [l["href"] for l in links if isinstance(l, dict) and str(l.get("href","")).startswith(("http://","https://"))]
-    return fallback[0] if fallback else None
+        if ext not in ALLOWED_EXT:
+            continue
 
+        # score
+        score = 0
+        if p.scheme == "https":
+            score += 4
+        rel = (l.get("rel") or "").lower()
+        typ = (l.get("type") or "").lower()
+        if rel.endswith("data#"):
+            score += 6
+        if any(k in typ for k in ("geotiff", "tiff")):
+            score += 3
+        if any(k in typ for k in ("hdf5", "hdf", "netcdf", "zip")):
+            score += 2
+        if "browse" in rel or "browse" in typ:
+            score -= 5
+
+        scored.append((score, u))
+
+    # sort & path-dedup
+    scored.sort(key=lambda t: t[0], reverse=True)
+    seen_paths: set[str] = set()
+    out: list[str] = []
+    for _, u in scored:
+        path = urlparse(u).path
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        out.append(u)
+    return out
 # -----------------------------------------------------------------------------
 # build-yaml
 # -----------------------------------------------------------------------------
@@ -563,6 +838,15 @@ def _first_data_link(d: dict) -> str | None:
     type=click.Path(path_type=Path),
     required=True,
     help="Path to the search results JSON produced by `dswx_enumerator search`.",
+)
+@click.option(
+    "--sensor",
+    type=click.Choice(["alos1", "sentinel-1", "nisar"], case_sensitive=False),
+    required=True,
+    help=(
+        "Sensor family for these granules: 'alos1', 'sentinel-1', or 'nisar'. "
+        "Selects the default template and any sensor-specific grouping/logic."
+    ),
 )
 @click.option(
     "--template",
@@ -603,6 +887,7 @@ def _first_data_link(d: dict) -> str | None:
 )
 def build_yaml_cmd(
     search_json: Path,
+    sensor: str,
     template: Path,
     paths_yaml: Path,   # kept for compatibility; not used by the current template
     yaml_out: Path,
@@ -627,55 +912,122 @@ def build_yaml_cmd(
     except Exception as e:
         raise click.BadParameter(f"--params must be valid JSON object: {e}")
 
+    tmpl = template or _default_template_path(sensor)
+    if not tmpl.exists():
+        raise click.ClickException(f"Runconfig template not found: {tmpl}")
+    click.echo(f"Using template: {tmpl}")
+
     root = input_dir or SETTINGS.download_root
     root = Path(root)
     yaml_out.mkdir(parents=True, exist_ok=True)
 
-    made = 0
-    missing = 0
+
+    granule_files: dict[str, list[Path]] = {}  # key = granule id/title/fallback, value = files present
+    missing_files = 0
     skipped = 0
-    input_files = []
-    if template is None:
-        template = _default_ni_template_path()
-    if not template.exists():
-        raise click.ClickException(f"Runconfig template not found: {template}")
-    click.echo(f"Using template: {template}")
-    for d in data:
-        url = _first_data_link(d)
-        if not url:
+
+    for d in _read_json(search_json):
+        urls = _data_links_from_granule(d)  # <-- MULTIPLE urls now
+        if not urls:
             skipped += 1
             continue
 
-        # Expected local filename from URL path (ignore query)
-        name = Path(urlparse(url).path).name
-        if not name:
-            skipped += 1
-            continue
+        gid = d.get("id") or d.get("title") or "granule"
+        files: list[Path] = []
+        for u in urls:
+            name = Path(urlparse(u).path).name
+            if not name:
+                continue
+            p = (root / name).resolve()
+            if p.exists():
+                files.append(p)
+            else:
+                missing_files += 1
 
-        local_path = (root / name).resolve()
-        if not local_path.exists():
-            click.echo(f"⤬ missing: {local_path}  (from {name})")
-            missing += 1
-            continue
-        else:
-            input_files.append(str(local_path))
-        # Build YAML for this concrete file
-        granule_id = d.get("title") or d.get("id") or name
-    text = render_runconfig(
-        template_path=Path(template),
-        local_path=str(local_path),
-        params=params_d,
-        input_files=(input_files)  # uncomment if your template expects a list
+        if files:
+            granule_files[gid] = sorted(files, key=lambda x: x.name)
+    made = 0
+
+    # ---------- Sensor routing ----------
+    sensor_key = sensor.lower()
+    if sensor_key == "alos1":
+        # One YAML per file
+        # for p in local_files:
+        text = render_runconfig(
+            template_path=tmpl,
+            local_path=str(files[0]),
+            params=params_d,
+            input_files=(files)
         )
+        # Prefer granule id where available
+        # dmatch = next((d for d in data if Path(urlparse(_first_data_link(d) or "").path).name == p.name), {})
+        # yname = f"{dmatch.get('id', p.stem)}.yml"
+        out_file = yaml_out / f"{d.get('id', name)}.yml"
+        # out_file = yaml_out / yname
+        out_file.write_text(text)
+        click.echo(f"✓ {out_file.name} (ALOS-1)")
+        made += 1
 
-    out_file = yaml_out / f"{d.get('id', name)}.yml"
-    out_file.write_text(text)
-    click.echo(f"✓ {out_file.name}")
-    made += 1
+    elif sensor_key == "sentinel-1":
+        # Group across ALL files by Tddd-dddddd-IW[1-3]
+        groups: dict[str, list[Path]] = {}
+        for files in granule_files.values():
+            for p in files:
+                key = _s1_group_key_from_name(p.name)
+                if key:
+                    groups.setdefault(key, []).append(p)
+                else:
+                    click.echo(f"• skipping non-S1-pattern file: {p.name}")
+        group_dirs = []
+        for key, files in groups.items():
+            grp_dir = root / key
+            grp_dir.mkdir(parents=True, exist_ok=True)
+            moved: list[Path] = []
+            for src in files:
+                dest = grp_dir / src.name
+                if src.resolve() != dest.resolve():
+                    dest.write_bytes(src.read_bytes())
+                    src.unlink()
+                moved.append(dest)
+            groups[key] = sorted(moved, key=lambda x: x.name)
+            group_dirs.append(grp_dir)
+            click.echo(f"Organized {len(moved)} file(s) → {grp_dir}")
 
+        # for key, files in sorted(groups.items()):
+        text = render_runconfig(
+            template_path=tmpl,
+            local_path=str(group_dirs[0]),               # representative
+            input_files=group_dirs,    # ALL files in group
+            params=params_d,
+        )
+        out_file = yaml_out / f"S1_{key}.yml"
+        out_file.write_text(text)
+        click.echo(f"✓ {out_file.name} (S1 group: {key}, {len(files)} files)")
+        made += 1
+
+    elif sensor_key == "nisar":
+        # Treat like single-file per granule; use NISAR template if present else NI (already handled)
+        text = render_runconfig(
+            template_path=tmpl,
+            local_path=str(files[0]),
+            params=params_d,
+            input_files=(files)
+
+        )
+        dmatch = next((d for d in data if Path(urlparse(_first_data_link(d) or "").path).name == p.name), {})
+        yname = f"{dmatch.get('id', p.stem)}.yml"
+        out_file = yaml_out / yname
+        out_file.write_text(text)
+        click.echo(f"✓ {out_file.name} (NISAR)")
+        made += 1
+
+    else:
+        raise click.ClickException(f"Unsupported sensor: {sensor}")
+
+    # Summary
     click.echo(f"\nWrote {made} runconfigs → {yaml_out}")
-    if missing:
-        click.echo(f"Note: {missing} file(s) referenced in the search JSON were not found under {root}")
+    if missing_files:
+        click.echo(f"Note: {missing_files} file(s) referenced in the search JSON were not found under {root}")
     if skipped:
         click.echo(f"Skipped {skipped} item(s) without a suitable data link")
 
@@ -683,181 +1035,63 @@ def build_yaml_cmd(
 @main.command("enumerate")
 @click.option(
     "--short-name",
-    help=(
-        "CMR collection short name (e.g., 'ALOS_PALSAR_RTC_HiRes'). "
-        "If no --concept-id is provided, the tool will try to resolve the Concept-ID."
-    ),
+    help="Collection short name (e.g., 'ALOS_PALSAR_RTC_HiRes', 'OPERA_L2_RTC-S1_V1')."
 )
 @click.option(
     "--concept-id",
-    help=(
-        "CMR collection Concept-ID (e.g., 'C1206487504-ASF'). "
-        "Preferred for speed/precision; overrides --short-name if both are given."
-    ),
+    help="Collection Concept-ID (e.g., 'C1206487504-ASF'). Overrides --short-name if both are given."
 )
-@click.option(
-    "--provider",
-    help=(
-        "Provider/data center hint (e.g., 'ASF', 'POCLOUD'). "
-        "Used to help resolve Concept-ID from --short-name."
-    ),
-)
-@click.option(
-    "--version",
-    help=(
-        "Collection version (e.g., '003'). Used only as a hint when resolving Concept-ID."
-    ),
-)
-# ---- spatial: bbox/polygon OR db + mgrs_set_id ----
+@click.option("--provider", help="Provider hint (e.g., 'ASF', 'POCLOUD').")
+@click.option("--version", help="Collection version (e.g., '003').")
+# spatial (one of: bbox/polygon OR db+mgrs)
 @click.option(
     "--bbox",
-    help=(
-        "Search bounding box as 'minlon,minlat,maxlon,maxlat' (WGS84). "
-        "Example: --bbox '-124,45,-121.5,46.5'."
-    ),
+    help="Search bounding box as 'minlon,minlat,maxlon,maxlat' (WGS84), e.g. --bbox '-124,45,-121.5,46.5'."
 )
 @click.option(
     "--polygon",
-    help=(
-        "Search polygon in WKT (lon/lat). Use either --bbox or --polygon (not both). "
-        "Example: \"POLYGON((-122.6 37.1,-122.6 37.7,-121.9 37.7,-121.9 37.1,-122.6 37.1))\""
-    ),
+    help="Search polygon in WKT (lon/lat). Use either --bbox or --polygon (not both)."
 )
-@click.option(
-    "--db",
-    "db_path",
-    type=click.Path(path_type=Path),
-    help=(
-        "Path to local vector database (GeoPackage/SpatiaLite/etc.) to look up polygons. "
-        "Used only with --mgrs-set-id."
-    ),
-)
-@click.option(
-    "--mgrs-set-id",
-    help=(
-        "MGRS set identifier to look up in --db. "
-        "If provided (with --db), overrides --bbox/--polygon."
-    ),
-)
-@click.option(
-    "--mgrs-layer",
-    default=None,
-    help=(
-        "Optional layer name in the vector DB (e.g., 'polygons'). "
-        "If omitted, the default layer is used."
-    ),
-)
-@click.option(
-    "--mgrs-id-col",
-    default="mgrs_set_id",
-    show_default=True,
-    help=(
-        "Column name in --db/--mgrs-layer that matches --mgrs-set-id "
-        "(e.g., 'mgrs_set_id' or 'name')."
-    ),
-)
-# ---- temporal / paging ----
-@click.option(
-    "--start",
-    help=(
-        "Start time (ISO8601). Example: 2007-01-01T00:00:00Z"
-    ),
-)
-@click.option(
-    "--end",
-    help=(
-        "End time (ISO8601). Example: 2011-12-31T23:59:59Z"
-    ),
-)
-@click.option(
-    "--max",
-    "max_items",
-    type=int,
-    default=1000,
-    show_default=True,
-    help=(
-        "Maximum number of granules to return (across pages). "
-        "If using DB polygons that split into parts, this applies per part."
-    ),
-)
-# ---- track selection policy ----
+@click.option("--db", "db_path", type=click.Path(path_type=Path), help="Vector DB/GPKG/SpatiaLite path for MGRS lookup.")
+@click.option("--mgrs-set-id", help="MGRS set identifier to look up in --db.")
+@click.option("--mgrs-layer", default=None, help="Optional layer/table name in the DB.")
+@click.option("--mgrs-id-col", default="mgrs_set_id", show_default=True, help="ID column name in the DB layer.")
+# temporal / paging
+@click.option("--start", help="Start time (ISO8601).")
+@click.option("--end", help="End time (ISO8601).")
+@click.option("--max", "max_items", type=int, default=1000, show_default=True,
+              help="Maximum number of granules to return (across pages).")
+# track policy
 @click.option(
     "--track",
-    help=(
-        "Optional track number to select (e.g., '777'). "
-        "REQUIRED to proceed with download/YAML if multiple tracks are present. "
-        "If omitted, the command prints a summary grouped by track and exits."
-    ),
+    help=("Optional track number (e.g., '777'). "
+          "If omitted and multiple tracks are present, a summary is printed and the command exits. "
+          "If omitted and exactly one track is present, it is auto-selected.")
 )
-# ---- download controls ----
+# download
+@click.option("--outdir", type=click.Path(path_type=Path), default=None,
+              help=f"Download directory. Default: DSWX_DOWNLOAD_ROOT ({SETTINGS.download_root}).")
+@click.option("--workers", type=int, default=None,
+              help=f"Parallel download workers. Default: DSWX_PARALLEL_DOWNLOADS ({SETTINGS.parallel_downloads}).")
+@click.option("--progress", type=click.Choice(["bytes", "files", "none"], case_sensitive=False),
+              default="bytes", show_default=True,
+              help="Progress display for downloads.")
+@click.option("--overwrite/--no-overwrite", default=False, show_default=True)
+@click.option("--resume/--no-resume", default=True, show_default=True)
+@click.option("--dedupe-names/--no-dedupe-names", default=False, show_default=True)
+# YAML
 @click.option(
-    "--outdir",
-    type=click.Path(path_type=Path),
-    default=None,
-    help=(
-        "Destination directory for downloads. "
-        "Default: DSWXNI_DOWNLOAD_ROOT (currently: "
-        f"{SETTINGS.download_root})."
-    ),
-)
-@click.option(
-    "--workers",
-    type=int,
-    default=None,
-    help=(
-        "Number of parallel download workers. "
-        f"Default: DSWXNI_PARALLEL_DOWNLOADS (currently: {SETTINGS.parallel_downloads})."
-    ),
-)
-@click.option(
-    "--progress",
-    type=click.Choice(["bytes","files","none"], case_sensitive=False),
-    default="bytes",
-    show_default=True,
-    help=(
-        "Progress display for downloads: 'bytes' shows a live bytes bar, "
-        "'files' shows one tick per completed file, 'none' disables progress."
-    ),
-)
-@click.option(
-    "--overwrite/--no-overwrite",
-    default=False,
-    show_default=True,
-    help="Re-download even if the destination file already exists.",
-)
-@click.option(
-    "--resume/--no-resume",
-    default=True,
-    show_default=True,
-    help="Attempt to resume partial downloads when the server supports HTTP Range.",
-)
-@click.option(
-    "--dedupe-names/--no-dedupe-names",
-    default=False,
-    show_default=True,
-    help="Append '__N' to filenames to avoid collisions instead of overwriting.",
-)
-# ---- yaml rendering ----
-@click.option(
-    "--template",
-    type=click.Path(path_type=Path),
-    required=False,
-    help="Jinja2 template for the DSWx-NI runconfig (e.g., templates/runconfig_dswx_ni.j2).",
-)
-@click.option(
-    "--yaml-out",
-    type=click.Path(path_type=Path),
+    "--sensor",
+    type=click.Choice(["alos1", "sentinel-1", "nisar"], case_sensitive=False),
     required=True,
-    help="Directory to write rendered runconfig YAML files.",
+    help="Selects the default template and minor policy for YAML rendering."
 )
-@click.option(
-    "--params",
-    default=None,
-    help=(
-        "JSON dict of extra parameters made available as 'params' in the template.\n"
-        "Example: --params '{\"threads\":16,\"tile_size\":4096}'"
-    ),
-)
+@click.option("--template", type=click.Path(path_type=Path), required=False,
+              help="Override Jinja2 template. Defaults by --sensor.")
+@click.option("--yaml-out", type=click.Path(path_type=Path), required=True,
+              help="Directory to write the single rendered runconfig YAML.")
+@click.option("--params", default=None,
+              help="JSON dict of extra parameters exposed as 'params' in the template.")
 def enumerate_cmd(
     short_name: Optional[str],
     concept_id: Optional[str],
@@ -879,142 +1113,102 @@ def enumerate_cmd(
     overwrite: bool,
     resume: bool,
     dedupe_names: bool,
-    template: Path,
+    sensor: str,
+    template: Optional[Path],
     yaml_out: Path,
     params: Optional[str],
 ):
     """
-    End-to-end: search → (optional) track filter → download → build YAMLs.
-
-    Behavior:
-      • If --track is omitted and results include >1 track, prints a summary and exits (no downloads).
-      • If --track is provided, filters to that track and proceeds with download + YAML.
+    End-to-end: search → (optional) track filter → download → build ONE YAML including all files.
     """
-    # ----------------------
-    # Validate identity
-    # ----------------------
+
+    # --- Identity / Concept-ID ---
     if not concept_id and not short_name:
-        raise click.UsageError(
-            "Provide either --concept-id or --short-name (with optional --provider/--version)."
-        )
+        raise click.UsageError("Provide either --concept-id or --short-name.")
     if not concept_id and short_name:
         concept_id = resolve_collection_concept_id(short_name, provider=provider, version=version)
     spec = CollectionSpec(short_name=short_name, concept_id=concept_id, provider=provider, version=version)
 
-    # ----------------------
-    # Spatial selection
-    # ----------------------
+    # --- Spatial validation ---
     using_db = bool(db_path and mgrs_set_id)
     using_bbox_poly = bool(bbox or polygon)
     if using_db and using_bbox_poly:
         raise click.BadParameter("Choose ONE spatial mode: either --db + --mgrs-set-id OR --bbox/--polygon.")
-    if not using_db and not using_bbox_poly:
-        raise click.BadParameter("Provide spatial constraints: either --bbox/--polygon OR --db + --mgrs-set-id.")
+    if not (using_db or using_bbox_poly):
+        raise click.BadParameter("Provide spatial constraints: --bbox/--polygon OR --db + --mgrs-set-id.")
 
-    # Collect granules (merge if multiple polygon parts)
+    # --- Search (same logic as `search`) ---
     temporal = Temporal(start=start, end=end)
-    granules_list = []
-
     if using_db:
         cmr_polys = _polygons_from_db_general(
             db_path=db_path,
-            mgrs_set_id=mgrs_set_id,         # type: ignore[arg-type]
+            mgrs_set_id=mgrs_set_id,
             layer=mgrs_layer,
             id_col=mgrs_id_col,
         )
-        click.echo(f"Using {len(cmr_polys)} polygon part(s) from DB for mgrs_set_id={mgrs_set_id}")
-
         by_id: dict[str, dict] = {}
-        for i, poly_str in enumerate(cmr_polys, 1):
-            spatial = Spatial(polygon_wkt=poly_str)
-            part = search_cmr_flexible(
-                spec,
-                spatial=spatial,
-                temporal=temporal,
-                max_items=max_items,
-            )
-            for g in part:
-                by_id[g.id] = g.to_dict()
-            click.echo(f"  part {i}: {len(part)} granules")
-        granules_list = list(by_id.values())
+        for poly in cmr_polys:
+            spatial = Spatial(polygon_wkt=poly)
+            part = search_cmr_flexible(spec, spatial=spatial, temporal=temporal, max_items=max_items)
+            for g in part: by_id[g.id] = g.to_dict()
+        payload = list(by_id.values())
     else:
-        if bbox and polygon:
-            raise click.BadParameter("Use either --bbox or --polygon, not both.")
         spatial = Spatial(polygon_wkt=polygon) if polygon else Spatial(bbox=_parse_bbox(bbox))
-        granules = search_cmr_flexible(
-            spec,
-            spatial=spatial,
-            temporal=temporal,
-            max_items=max_items,
-        )
-        granules_list = [g.to_dict() for g in granules]
+        granules = search_cmr_flexible(spec, spatial=spatial, temporal=temporal, max_items=max_items)
+        payload = [g.to_dict() for g in granules]
 
-    if not granules_list:
+    if not payload:
         click.echo("No granules found for the given constraints.")
         return
 
-    # ----------------------
-    # Track grouping / policy
-    # ----------------------
-    from collections import defaultdict
-    by_track: dict[str, list[dict]] = defaultdict(list)
-    for d in granules_list:
-        t = _extract_track(d) or "unknown"
+    # --- Track grouping (same policy as `search`) ---
+    by_track = defaultdict(list)
+    is_s1 = (short_name == "OPERA_L2_RTC-S1_V1") or (concept_id == "C2777436413-ASF")
+    for d in payload:
+        t = _extract_track_s1(d) if is_s1 else (_extract_track(d) or "unknown")
         by_track[t].append(d)
 
     if not track:
-        # summarize and exit (no downloads)
-        multi = len([k for k in by_track.keys() if k != "unknown"]) > 1
-        if multi:
+        track_keys = [k for k in by_track if k != "unknown"]
+        if len(track_keys) > 1:
+            # print summary and exit
             click.echo("⚠️  Multiple tracks detected; this may be unexpected.\n")
-        total = sum(len(v) for v in by_track.values())
-        click.echo(f"Total granules: {total}")
-        for k in sorted(by_track.keys(), key=lambda k: (k == "unknown", k)):
-            rows = by_track[k]
-            click.echo(f"- track={k} : {len(rows)}")
-            for trow in rows[:3]:
-                click.echo(f"    • {trow.get('title') or trow.get('id')}")
-        click.echo("\nTip: re-run with --track <number> to select and proceed with download + YAML.")
-        return
+            total = sum(len(v) for v in by_track.values())
+            click.echo(f"Total granules: {total}")
+            for k in sorted(by_track.keys(), key=lambda k: (k == "unknown", k)):
+                rows = by_track[k]
+                click.echo(f"- track={k} : {len(rows)}")
+                for trow in rows[:3]:
+                    click.echo(f"    • {trow.get('title') or trow.get('id')}")
+            click.echo("\nTip: re-run with --track <number> to proceed with download + YAML.")
+            return
+        elif len(track_keys) == 1:
+            track = track_keys[0]
+            click.echo(f"No --track specified; auto-selecting track={track}.")
+        else:
+            click.echo("No track metadata detected; proceeding without track filter.")
+            # leave track as None → select whole payload
 
-    # Filter to selected track
-    selected = by_track.get(track) or []
+    selected = by_track.get(track, payload) if track else payload
     if not selected:
-        click.echo(f"No granules found for track={track}. Available: {', '.join(sorted(k for k in by_track.keys() if k!='unknown')) or '(none)'}")
+        click.echo(f"No granules found for track={track}.")
         return
-    click.echo(f"Proceeding with track={track}: {len(selected)} granules")
 
-    # ----------------------
-    # Select data URLs (allowed extensions only)
-    # ----------------------
-    from urllib.parse import urlparse
-    ALLOWED_EXT = {".zip", ".tif", ".tiff", ".h5"}
-
-    def pick_url(d: dict) -> tuple[str|None, str]:
-        url = _first_data_link(d)
-        return url, (d.get("id") or d.get("title") or "granule")
-
-    url_to_meta: dict[str, dict] = {}
+    # --- Collect ALL URLs from selected granules (multi-link per granule) ---
     urls: list[str] = []
+    seen_paths: set[str] = set()
     for d in selected:
-        u, _ = pick_url(d)
-        if not u:
-            continue
-        # enforce extension filter
-        ext = Path(urlparse(u).path).suffix.lower()
-        if ext not in ALLOWED_EXT:
-            continue
-        if u not in url_to_meta:
-            url_to_meta[u] = d
+        for u in _data_links_from_granule(d):
+            path = urlparse(u).path
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
             urls.append(u)
-
     if not urls:
-        click.echo("No downloadable data links (zip/tif/tiff/h5) found for the selected track.")
+        click.echo("No downloadable data links (zip/tif/tiff/h5) in selected granules.")
         return
 
-    # ----------------------
-    # Download
-    # ----------------------
+    # --- Download ---
     if workers:
         SETTINGS.parallel_downloads = workers
     dl_root = Path(outdir or SETTINGS.download_root)
@@ -1026,52 +1220,57 @@ def enumerate_cmd(
         overwrite=overwrite,
         resume=resume,
         dedupe_names=dedupe_names,
-        show_progress=progress,  # uses your tqdm integration
+        show_progress=progress,
     )
-
     ok = [r for r in results if r.status in ("downloaded", "verified", "exists") and r.path]
-    if not ok:
-        click.echo("No files downloaded successfully; aborting YAML generation.")
-        return
     click.echo(f"{len(ok)}/{len(results)} OK")
+    if not ok:
+        click.echo("No files available; aborting YAML generation.")
+        return
 
-    # ----------------------
-    # Build YAMLs only for files that exist
-    # ----------------------
-    if template is None:
-        template = _default_ni_template_path()
-    if not template.exists():
-        raise click.ClickException(f"Runconfig template not found: {template}")
-    click.echo(f"Using template: {template}")
-
+    # --- Build ONE YAML with all successfully downloaded files ---
     try:
         params_d = json.loads(params) if params else {}
         if params and not isinstance(params_d, dict):
-            raise ValueError("params JSON must be an object/dict")
+            raise ValueError("params JSON must be a dict/object")
     except Exception as e:
         raise click.BadParameter(f"--params must be valid JSON object: {e}")
 
+    tmpl = Path(template) if template else _default_template_path(sensor)
+    if not tmpl.exists():
+        raise click.ClickException(f"Runconfig template not found: {tmpl}")
+
     yaml_out.mkdir(parents=True, exist_ok=True)
-    input_files = []
-    made = 0
-    for r in ok:
-        d = url_to_meta.get(r.url, {})
-        local_path = str(Path(r.path).resolve())
-        granule_id = d.get("title") or d.get("id") or Path(local_path).stem
-        input_files.append(str(local_path))
+    granule_files = _granule_files_present(selected, root=dl_root)
 
-    text = render_runconfig(
-        template_path=Path(template),
-        local_path=local_path,
-        params=params_d,
-        input_files=(input_files)
+    made = _render_by_sensor(
+        sensor=sensor, template=tmpl, granule_files=granule_files,
+        yaml_out=yaml_out, params_d=params_d,
+        organize_s1=False, root=dl_root,   # set True to auto-organize S1 into group dirs
     )
-    out_file = yaml_out / f"{d.get('id', Path(local_path).stem)}.yml"
-    out_file.write_text(text)
-    click.echo(f"✓ {out_file.name}")
-    made += 1
-
     click.echo(f"\nWrote {made} runconfigs → {yaml_out}")
+
+    # _render_by_sensor(
+    #     *, sensor: str, template: Path, granule_files: dict[str, list[Path]],
+    #     yaml_out: Path, params_d: dict, organize_s1: bool = False, root: Optional[Path] = None
+    # local_files = sorted({Path(r.path).resolve() for r in ok}, key=lambda p: p.name)
+    # text = render_runconfig(
+    #     template_path=tmpl,
+    #     local_path=str(local_files[0]),                  # representative
+    #     input_files=[str(p) for p in local_files],       # ALL files in one config
+    #     params=params_d,
+    # )
+
+    # # Name the YAML meaningfully
+    # name_bits = [sensor.lower()]
+    # if track: name_bits.append(f"T{track}")
+    # name_bits.append(f"batch_{len(local_files)}")
+    # out_file = yaml_out / ("_".join(name_bits) + ".yml")
+
+    # out_file.write_text(text)
+    # click.echo(f"✓ wrote {out_file.name} with {len(local_files)} input file(s)")
+    # click.echo(f"\nWrote 1 runconfig → {yaml_out}")
+
 
 # -----------------------------------------------------------------------------
 # resolve-cid (utility)
