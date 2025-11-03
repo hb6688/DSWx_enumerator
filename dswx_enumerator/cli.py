@@ -21,6 +21,8 @@ import re
 from collections import defaultdict
 
 import click
+import subprocess
+import yaml
 
 from .cmr_client import (
     search_cmr_flexible,
@@ -33,6 +35,9 @@ from .mgrs_db_reader import _polygons_from_db_general
 from .downloader import download_all
 from .settings import SETTINGS
 from .yaml_builder import render_runconfig
+import dswx_sar.dswx_s1
+import dswx_sar.dswx_ni
+
 
 ALLOWED_EXT = {".zip", ".tif", ".tiff", ".h5"}
 
@@ -221,6 +226,75 @@ def _granule_files_present(
             granule_files[gid] = sorted(files, key=lambda x: x.name)
     return granule_files
 
+def _read_product_path(yaml_path: str):
+    """
+    Read product output path
+    """
+
+    yaml_config = Path(yaml_path).expanduser().resolve()
+
+    # --- Path checks ---
+    if not yaml_config.exists():
+        raise FileNotFoundError(f"Runconfig YAML configuration file not found: {yaml_config}")
+
+    if yaml_config.is_dir():
+        raise IsADirectoryError(f"Expected a file, got a directory: {yaml_config}")
+
+    with yaml_config.open("r") as f:
+        cfg = yaml.safe_load(f)
+
+    try:
+        prod_relative_path = Path(cfg["runconfig"]["groups"]["product_path_group"]["sas_output_path"])
+    except KeyError as e:
+        raise KeyError("Missing runconfig.groups.product_path_group.product_path") from e
+
+    if prod_relative_path.is_absolute():
+        return prod_relative_path
+    
+    # Resolve relative paths against the YAML's directory
+    product_abs_path = (yaml_config.parent.parent / prod_relative_path).resolve()
+
+    return product_abs_path
+
+def _run_dswx_sar(
+    yaml_config,
+    sensor,
+):
+    if sensor == 'sentinel-1':
+        # Call DSWX-SAR via CLI
+        module = "dswx_sar.dswx_s1"
+    elif sensor == 'nisar':
+        module = "dswx_sar.dswx_ni"
+
+    yaml_path = str(Path(yaml_config).resolve())
+
+    cmd = ["python", "-m", module, yaml_path]
+
+    subprocess.run(cmd, check=True)
+
+def _run_dwsx_hls_acc(
+        dswx_data_dir: str,
+        acc_output_dir: str,
+        hls_acc_script: str,
+        earthdata_token: str,
+    ):
+    """
+    Run DSWX-HLS Accuracy comparison.
+    """
+    if not earthdata_token:
+        raise click.ClickException(
+            "Missing Earthdata bearer token (--earthdata_token). Please provide a valid EBT "
+        )
+
+    acc_output_dir = str(Path(acc_output_dir).resolve())
+
+    subprocess.run([
+        'python', '-m', hls_acc_script,
+        '-i', dswx_data_dir,
+        '-o', acc_output_dir,
+        '-t', earthdata_token,
+    ], check=True)
+
 
 def _render_by_sensor(
     *, sensor: str, template: Path, granule_files: dict[str, list[Path]],
@@ -307,7 +381,9 @@ def _render_by_sensor(
 
     # Summary
     click.echo(f"\nWrote {made} runconfigs → {yaml_out}")
+    click.echo(f"\nWrote  → {out_file}")
 
+    return made, out_file
 
 # -----------------------------------------------------------------------------
 # Top-level group
@@ -1032,6 +1108,9 @@ def build_yaml_cmd(
         click.echo(f"Skipped {skipped} item(s) without a suitable data link")
 
 
+# -----------------------------------------------------------------------------
+# enumerate
+# -----------------------------------------------------------------------------
 @main.command("enumerate")
 @click.option(
     "--short-name",
@@ -1092,6 +1171,25 @@ def build_yaml_cmd(
               help="Directory to write the single rendered runconfig YAML.")
 @click.option("--params", default=None,
               help="JSON dict of extra parameters exposed as 'params' in the template.")
+@click.option(
+    "--acc_output_dir",
+    type=click.Path(path_type=Path), 
+    default=None,
+    help="Data directory for DSWx-SAR products."
+)
+@click.option(
+    "--hls_acc_script",
+    type=str, 
+    default=None,
+    help="Script which compares DSWx-SAR output against DSWx-HLS for accuracy"
+)
+@click.option(
+    "--earthdata_token",
+    type=str, 
+    default=None,
+    help="Earthdata login bearer token (EBT) for accessing NASA CMR/POCLOUD data."
+)
+
 def enumerate_cmd(
     short_name: Optional[str],
     concept_id: Optional[str],
@@ -1117,6 +1215,9 @@ def enumerate_cmd(
     template: Optional[Path],
     yaml_out: Path,
     params: Optional[str],
+    acc_output_dir: str,
+    hls_acc_script: str,
+    earthdata_token: str,
 ):
     """
     End-to-end: search → (optional) track filter → download → build ONE YAML including all files.
@@ -1243,12 +1344,35 @@ def enumerate_cmd(
     yaml_out.mkdir(parents=True, exist_ok=True)
     granule_files = _granule_files_present(selected, root=dl_root)
 
-    made = _render_by_sensor(
+    made, yaml_config = _render_by_sensor(
         sensor=sensor, template=tmpl, granule_files=granule_files,
         yaml_out=yaml_out, params_d=params_d,
         organize_s1=False, root=dl_root,   # set True to auto-organize S1 into group dirs
     )
     click.echo(f"\nWrote {made} runconfigs → {yaml_out}")
+
+    click.echo(f"\n---Start running DSWx-SAR Algorithm---\n")
+    # --- Run DSWx-SAR Algorithms --- 
+    _run_dswx_sar(
+        yaml_config, 
+        sensor,
+    )
+    click.echo(f"\n---Completed running DSWx-SAR Algorithm---\n")
+
+    click.echo(f"\n---Start running DSWx-HLS Accuracy Comparison---\n")
+
+    # Run DSWx-HLS comparison for accuracy
+    #Read YAML file product path
+    dswx_data_dir = _read_product_path(yaml_config)
+
+    _run_dwsx_hls_acc(
+        dswx_data_dir,
+        acc_output_dir,
+        hls_acc_script,
+        earthdata_token,
+    )
+
+    click.echo(f"\n---Completed running DSWx-HLS Accuracy Comparison---\n")
 
     # _render_by_sensor(
     #     *, sensor: str, template: Path, granule_files: dict[str, list[Path]],
@@ -1292,3 +1416,98 @@ def resolve_cid_cmd(short_name: str, provider: Optional[str], version: Optional[
     if not cid:
         raise click.ClickException("No Concept-ID found.")
     click.echo(cid)
+
+
+# -----------------------------------------------------------------------------
+# run-dswx-sar
+# -----------------------------------------------------------------------------
+@main.command("run_dswx_sar")
+@click.option(
+    "--yaml_config",
+    type=click.Path(path_type=Path, dir_okay=False, exists=True),
+    help="YAML configuration file to run for DSWx-SAR."
+)
+@click.option(
+    "--sensor",
+    type=click.Choice(["alos1", "sentinel-1", "nisar"], case_sensitive=False),
+    required=True,
+    help=(
+        "Sensor family for these granules: 'alos1', 'sentinel-1', or 'nisar'. "
+        "Selects the default template and any sensor-specific grouping/logic."
+    ),
+)
+
+def run_dswx_sar_cmd(
+    yaml_config: str, 
+    sensor: str,
+):
+    """
+    Run DSWX-SAR for Sentinel-1 using a single runconfig YAML.
+    """
+
+    if sensor == 'sentinel-1':
+        # Call DSWX-SAR via CLI
+        module = "dswx_sar.dswx_s1"
+    elif sensor == 'nisar':
+        module = "dswx_sar.dswx_ni"
+
+    yaml_path = str(Path(yaml_config).resolve())
+
+    cmd = ["python", "-m", module, yaml_path]
+
+    subprocess.run(cmd, check=True)
+
+# -----------------------------------------------------------------------------
+# compute-dswx-HLS_acc
+# -----------------------------------------------------------------------------
+@main.command("compute_dswx_hls_acc")
+@click.option(
+    "--dswx_data_dir",
+    type=click.Path(path_type=Path), 
+    default=None,
+    help="Data directory for DSWx-SAR products."
+)
+@click.option(
+    "--acc_output_dir",
+    type=click.Path(path_type=Path), 
+    default=None,
+    help="Data directory for DSWx-SAR products."
+)
+@click.option(
+    "--hls_acc_script",
+    type=str, 
+    default=None,
+    help="Script which compares DSWx-SAR output against DSWx-HLS for accuracy"
+)
+@click.option(
+    "--earthdata_token",
+    type=str, 
+    default=None,
+    help="Earthdata login bearer token (EBT) for accessing NASA CMR/POCLOUD data."
+)
+
+def compute_dswx_hls_acc_cmd(
+    dswx_data_dir: str, 
+    acc_output_dir: str,
+    hls_acc_script: str,
+    earthdata_token: str,
+
+):
+    """
+    Run DSWX-HLS Accuracy comparison.
+    """
+
+    if not earthdata_token:
+        raise click.ClickException(
+            "Missing Earthdata bearer token (--earthdata_token). Please provide a valid EBT "
+        )
+
+    dswx_data_dir = str(Path(dswx_data_dir).resolve())
+    acc_output_dir = str(Path(acc_output_dir).resolve())
+
+    subprocess.run([
+        'python', '-m', hls_acc_script,
+        '-i', dswx_data_dir,
+        '-o', acc_output_dir,
+        '-t', earthdata_token,
+    ], check=True)   
