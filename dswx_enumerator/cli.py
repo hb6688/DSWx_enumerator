@@ -1352,6 +1352,7 @@ def enumerate_cmd(
     click.echo(f"\nWrote {made} runconfigs → {yaml_out}")
 
     click.echo(f"\n---Start running DSWx-SAR Algorithm---\n")
+
     # --- Run DSWx-SAR Algorithms --- 
     _run_dswx_sar(
         yaml_config, 
@@ -1362,7 +1363,7 @@ def enumerate_cmd(
     click.echo(f"\n---Start running DSWx-HLS Accuracy Comparison---\n")
 
     # Run DSWx-HLS comparison for accuracy
-    #Read YAML file product path
+    # Read YAML file product path
     dswx_data_dir = _read_product_path(yaml_config)
 
     _run_dwsx_hls_acc(
